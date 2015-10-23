@@ -64,6 +64,10 @@ func Sublevel(db *levigo.DB, prefix string) *DB {
 	return &DB{db: db, prefix: append([]byte(prefix),0)}
 }
 
+func (this *DB) LevelDB() *levigo.DB {
+	return this.db
+}
+
 func (this *DB) AddHook(hook HookFunc) {
 	this.hooks = append(this.hooks, hook)
 }
@@ -84,7 +88,7 @@ func (this *DB) Delete(wo *levigo.WriteOptions, key []byte) error {
 	return this.db.Delete(wo, newkey)
 }
 
-func (this *DB) deleteInHook(key []byte, batch *levigo.WriteBatch) error {
+func (this *DB) DeleteInBatch(key []byte, batch *levigo.WriteBatch) error {
 	if len(this.hooks) != 0 {
 		tmp := &tmpHook{db: this, key: key, value: nil, batch: batch}
 		for _, h := range this.hooks {
@@ -122,7 +126,7 @@ func (this *DB) Put(wo *levigo.WriteOptions, key, value []byte) error {
 	return this.db.Put(wo, newkey, value)
 }
 
-func (this *DB) putInHook(key, value []byte, batch *levigo.WriteBatch) error {
+func (this *DB) PutInBatch(key, value []byte, batch *levigo.WriteBatch) error {
 	if len(this.hooks) != 0 {
 		tmp := &tmpHook{db: this, key: key, value: value, batch: batch}
 		for _, h := range this.hooks {
@@ -277,7 +281,7 @@ func (this *WriteBatch) Put(key, value []byte) {
 func (this *tmpHook) Delete(key []byte, sublevel *DB) {
 	this.ensureBatch()
 	if sublevel != nil {
-		sublevel.deleteInHook(key, this.batch)
+		sublevel.DeleteInBatch(key, this.batch)
 	} else {
 		newkey := append(this.db.prefix, key...)
 		this.batch.Delete(newkey)
@@ -287,7 +291,7 @@ func (this *tmpHook) Delete(key []byte, sublevel *DB) {
 func (this *tmpHook) Put(key, value []byte, sublevel *DB) {
 	this.ensureBatch()
 	if sublevel != nil {
-		sublevel.putInHook(key, value, this.batch)
+		sublevel.PutInBatch(key, value, this.batch)
 	} else {
 		newkey := append(this.db.prefix, key...)
 		this.batch.Put(newkey, value)	
@@ -315,7 +319,7 @@ func (this *tmpHook) ensureBatch() {
 
 func (this *tmpBatchHook) Delete(key []byte, sublevel *DB) {
 	if sublevel != nil {
-		sublevel.deleteInHook(key, this.batch)
+		sublevel.DeleteInBatch(key, this.batch)
 	} else {
 		newkey := append(this.db.prefix, key...)
 		this.batch.Delete(newkey)
@@ -324,7 +328,7 @@ func (this *tmpBatchHook) Delete(key []byte, sublevel *DB) {
 
 func (this *tmpBatchHook) Put(key, value []byte, sublevel *DB) {
 	if sublevel != nil {
-		sublevel.putInHook(key, value, this.batch)
+		sublevel.PutInBatch(key, value, this.batch)
 	} else {
 		newkey := append(this.db.prefix, key...)
 		this.batch.Put(newkey, value)	
