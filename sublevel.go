@@ -91,7 +91,7 @@ func (this *DB) Delete(wo *levigo.WriteOptions, key []byte) (err error) {
 			h(key, nil, hook)
 		}
 	}
-	if hook.batch != nil {
+	if hook != nil && hook.batch != nil {
 		err = this.db.Write(wo, hook.batch)
 		hook.batch.Close()
 	} else {
@@ -139,6 +139,7 @@ func (this *DB) NewIterator(ro *levigo.ReadOptions) Iterator {
 }
 
 func (this *DB) Put(wo *levigo.WriteOptions, key, value []byte) (err error) {
+//	println("put start", string(key), string(value))
 	var hook *Hook
 	if len(this.pre) != 0 || len(this.post) != 0 {
 		hook = &Hook{db: this, key: key, value: value}
@@ -165,6 +166,7 @@ func (this *DB) Put(wo *levigo.WriteOptions, key, value []byte) (err error) {
 			}
 		}
 	}
+//	println("put end", string(key), string(value))
 	return
 }
 
@@ -209,6 +211,29 @@ func (this *DB) Write(wo *levigo.WriteOptions, w *WriteBatch) (err error) {
 	return
 }
 
+func (this *DB) Simulate(wo *levigo.WriteOptions, key, value []byte) (err error) {
+	var hook *Hook
+	if len(this.pre) != 0 || len(this.post) != 0 {
+		hook = &Hook{db: this, key: key, value: value}
+		for _, h := range this.pre {
+			h(key, value, hook)
+		}
+	}
+	if hook != nil && hook.batch != nil {
+		err = this.db.Write(wo, hook.batch)
+		hook.batch.Close()
+	}
+	if hook != nil {
+		this.runPost(hook)
+		if hook.sublevels != nil {
+			for _, s := range hook.sublevels {
+				s.runPost(hook)
+			}
+		}
+	}
+	return
+}
+
 func (this *DB) runPost(hook *Hook) {
 	if len(this.post) != 0 {
 		if hook.batch != nil {
@@ -220,10 +245,8 @@ func (this *DB) runPost(hook *Hook) {
 				}
 			}
 		} else if (hook.db == this && hook.key != nil) {
-			if bytes.HasPrefix(hook.key, this.prefix) {
-				for _, h := range this.post {
-					h(hook.key, hook.value, hook)
-				}
+			for _, h := range this.post {
+				h(hook.key, hook.value, hook)
 			}
 		}
 	}
