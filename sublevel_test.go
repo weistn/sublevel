@@ -3,6 +3,7 @@ package sublevel
 import (
 	"testing"
 	"fmt"
+	"bytes"
 	"github.com/jmhodges/levigo"
 )
 
@@ -126,20 +127,40 @@ func TestHook(t *testing.T) {
 	sub1 := Sublevel(db, "input")
 	sub2 := Sublevel(db, "output")
 	sub3 := Sublevel(db, "output2")
-	sub1.AddHook(func(key, value []byte, hook Hook) {
+	sub1.Pre(func(key, value []byte, hook *Hook) {
 		if value != nil {
 			hook.Put(append([]byte("D_"), key...), value, sub2)	
 		} else {
 			hook.Delete(append([]byte("D_"), key...), sub2)			
 		}
 	})
-	sub2.AddHook(func(key, value []byte, hook Hook) {
+	sub2.Pre(func(key, value []byte, hook *Hook) {
 		if value != nil {
 			hook.Put(append([]byte("X_"), key...), value, sub3)	
 		} else {
 			hook.Delete(append([]byte("X_"), key...), sub3)		
 		}
 	})
+
+	post1Called := 0
+	post3Called := 0
+
+	sub1.Post(func(key, value []byte, hook *Hook) {
+		post1Called++
+		val, err := sub1.Get(ro, key)
+		if err != nil || bytes.Compare(val, value) != 0 {
+			t.Fatal(err, string(val), string(value))
+		}		
+	})
+
+	sub3.Post(func(key, value []byte, hook *Hook) {
+		post3Called++
+		val, err := sub3.Get(ro, key)
+		if err != nil || bytes.Compare(val, value) != 0 {
+			t.Fatal(err, "read=", string(val), "hook=", string(value))
+		}		
+	})
+
 	sub1.Put(wo, []byte("Name"), []byte("Horst"))
 	val, err := sub1.Get(ro, []byte("Name"))
 	if err != nil || string(val) != "Horst" {
@@ -173,6 +194,13 @@ func TestHook(t *testing.T) {
 	batch.Put([]byte("Sound"), []byte("Ping"))
 	batch.Delete([]byte("Color"))
 	sub1.Write(wo, batch)
+
+	if post1Called != 5 {
+		t.Fatal(post1Called)
+	}
+	if post3Called != 5 {
+		t.Fatal(post3Called)
+	}
 
 	val, err = sub1.Get(ro, []byte("Color"))
 	if err != nil || val != nil {

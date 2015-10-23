@@ -2,6 +2,7 @@ package sublevel
 
 import (
 	"github.com/jmhodges/levigo"
+	"bytes"
 )
 
 type Iterator interface {
@@ -17,23 +18,27 @@ type Iterator interface {
 	Value() []byte
 }
 
+/*
 type Hook interface {
 	Delete(key []byte, sublevel *DB)
 	Put(key, value []byte, sublevel *DB)
 }
+*/
 
-type HookFunc func(key, value []byte, hook Hook)
+type HookFunc func(key, value []byte, hook *Hook)
 
 type WriteBatch struct {
 	db *DB
 	batch *levigo.WriteBatch
-	prefix []byte
+	hook *Hook
 }
 
 type DB struct {
 	db *levigo.DB
+	prefixStr string
 	prefix []byte
-	hooks []HookFunc
+	pre []HookFunc
+	post []HookFunc
 }
 
 type sublevelIterator struct {
@@ -42,16 +47,18 @@ type sublevelIterator struct {
 	valid bool
 }
 
-type tmpHook struct {
-	db *DB
-	batch *levigo.WriteBatch
+type KeyValue struct {
 	key []byte
 	value []byte
 }
 
-type tmpBatchHook struct {
+type Hook struct {
 	db *DB
 	batch *levigo.WriteBatch
+	key []byte
+	value []byte
+	sublevels map[string]*DB
+	kv []KeyValue
 }
 
 /**************************************************************
@@ -61,42 +68,63 @@ type tmpBatchHook struct {
  **************************************************************/
 
 func Sublevel(db *levigo.DB, prefix string) *DB {
-	return &DB{db: db, prefix: append([]byte(prefix),0)}
+	return &DB{db: db, prefix: append([]byte(prefix),0), prefixStr: prefix}
 }
 
 func (this *DB) LevelDB() *levigo.DB {
 	return this.db
 }
 
-func (this *DB) AddHook(hook HookFunc) {
-	this.hooks = append(this.hooks, hook)
+func (this *DB) Pre(hook HookFunc) {
+	this.pre = append(this.pre, hook)
 }
 
-func (this *DB) Delete(wo *levigo.WriteOptions, key []byte) error {
-	if len(this.hooks) != 0 {
-		tmp := &tmpHook{db: this, key: key, value: nil}
-		for _, h := range this.hooks {
-			h(key, nil, tmp)
-		}
-		if tmp.batch != nil {
-			err := this.db.Write(wo, tmp.batch)
-			tmp.batch.Close()
-			return err
-		}
-	}
-	newkey := append(this.prefix, key...)
-	return this.db.Delete(wo, newkey)
+func (this *DB) Post(hook HookFunc) {
+	this.post = append(this.post, hook)
 }
 
-func (this *DB) DeleteInBatch(key []byte, batch *levigo.WriteBatch) error {
-	if len(this.hooks) != 0 {
-		tmp := &tmpHook{db: this, key: key, value: nil, batch: batch}
-		for _, h := range this.hooks {
-			h(key, nil, tmp)
+func (this *DB) Delete(wo *levigo.WriteOptions, key []byte) (err error) {
+	var hook *Hook
+	if len(this.pre) != 0 || len(this.post) != 0 {
+		hook = &Hook{db: this, key: key, value: nil}
+		for _, h := range this.pre {
+			h(key, nil, hook)
 		}
 	}
+	if hook.batch != nil {
+		err = this.db.Write(wo, hook.batch)
+		hook.batch.Close()
+	} else {
+		newkey := append(this.prefix, key...)
+		err = this.db.Delete(wo, newkey)
+	}
+	if err != nil {
+		// TODO: Unlock something?
+		return
+	}
+	if hook != nil {
+		this.runPost(hook)
+		if hook.sublevels != nil {
+			for _, s := range hook.sublevels {
+				s.runPost(hook)
+			}
+		}
+	}
+	return
+}
+
+func (this *DB) deleteInHook(key []byte, hook *Hook) error {
 	newkey := append(this.prefix, key...)
-	batch.Delete(newkey)
+	hook.kv = append(hook.kv, KeyValue{newkey, nil})
+	if len(this.pre) != 0 {
+		for _, h := range this.pre {
+			h(key, nil, hook)
+		}
+	}
+	if len(this.post) != 0 {
+		hook.addSublevel(this)
+	}
+	hook.batch.Delete(newkey)
 	return nil
 }
 
@@ -110,40 +138,95 @@ func (this *DB) NewIterator(ro *levigo.ReadOptions) Iterator {
 	return it
 }
 
-func (this *DB) Put(wo *levigo.WriteOptions, key, value []byte) error {
-	if len(this.hooks) != 0 {
-		tmp := &tmpHook{db: this, key: key, value: value}
-		for _, h := range this.hooks {
-			h(key, value, tmp)
-		}
-		if tmp.batch != nil {
-			err := this.db.Write(wo, tmp.batch)
-			tmp.batch.Close()
-			return err
+func (this *DB) Put(wo *levigo.WriteOptions, key, value []byte) (err error) {
+	var hook *Hook
+	if len(this.pre) != 0 || len(this.post) != 0 {
+		hook = &Hook{db: this, key: key, value: value}
+		for _, h := range this.pre {
+			h(key, value, hook)
 		}
 	}
-	newkey := append(this.prefix, key...)
-	return this.db.Put(wo, newkey, value)
+	if hook != nil && hook.batch != nil {
+		err = this.db.Write(wo, hook.batch)
+		hook.batch.Close()
+	} else {
+		newkey := append(this.prefix, key...)
+		err = this.db.Put(wo, newkey, value)
+	}
+	if err != nil {
+		// TODO: Unlock something?
+		return
+	}
+	if hook != nil {
+		this.runPost(hook)
+		if hook.sublevels != nil {
+			for _, s := range hook.sublevels {
+				s.runPost(hook)
+			}
+		}
+	}
+	return
 }
 
-func (this *DB) PutInBatch(key, value []byte, batch *levigo.WriteBatch) error {
-	if len(this.hooks) != 0 {
-		tmp := &tmpHook{db: this, key: key, value: value, batch: batch}
-		for _, h := range this.hooks {
-			h(key, value, tmp)
+func (this *DB) putInHook(key, value []byte, hook *Hook) error {
+	newkey := append(this.prefix, key...)
+	hook.kv = append(hook.kv, KeyValue{newkey, value})
+	if len(this.pre) != 0 {
+		for _, h := range this.pre {
+			h(key, value, hook)
 		}
 	}
-	newkey := append(this.prefix, key...)
-	batch.Put(newkey, value)
+	if len(this.post) != 0 {
+		hook.addSublevel(this)
+	}
+	hook.batch.Put(newkey, value)
 	return nil
 }
 
-func (this *DB) Write(wo *levigo.WriteOptions, w *WriteBatch) error {
-	return this.db.Write(wo, w.batch)
+func (this *DB) NewWriteBatch() *WriteBatch {
+	batch := levigo.NewWriteBatch()
+	var hook *Hook
+	if len(this.pre) != 0 || len(this.post) != 0 {
+		hook = &Hook{db: this, batch: batch}
+	}
+	return &WriteBatch{db: this, batch: batch, hook: hook}
 }
 
-func (this *DB) NewWriteBatch() *WriteBatch {
-	return &WriteBatch{db: this, batch: levigo.NewWriteBatch(), prefix: this.prefix}
+func (this *DB) Write(wo *levigo.WriteOptions, w *WriteBatch) (err error) {
+	err = this.db.Write(wo, w.batch)
+	if err != nil {
+		// TODO: Unlock something?
+		return
+	}
+	if w.hook != nil {
+		this.runPost(w.hook)
+		if w.hook.sublevels != nil {
+			for _, s := range w.hook.sublevels {
+				s.runPost(w.hook)
+			}
+		}		
+	}
+	return
+}
+
+func (this *DB) runPost(hook *Hook) {
+	if len(this.post) != 0 {
+		if hook.batch != nil {
+			for _, kv := range hook.kv {
+				if bytes.HasPrefix(kv.key, this.prefix) {
+					for _, h := range this.post {
+						h(kv.key[len(this.prefix):], kv.value, hook)
+					}
+				}
+			}
+		} else if (hook.db == this && hook.key != nil) {
+			if bytes.HasPrefix(hook.key, this.prefix) {
+				for _, h := range this.post {
+					h(hook.key, hook.value, hook)
+				}
+			}
+		}
+	}
 }
 
 /**************************************************************
@@ -242,95 +325,84 @@ func (this *sublevelIterator) checkValid() {
  *
  **************************************************************/
 
-func (this *WriteBatch) Clear() {
-	this.batch.Clear()
-}
+//func (this *WriteBatch) Clear() {
+//	this.batch.Clear()
+//}
 
 func (this *WriteBatch) Close() {
 	this.batch.Close()
 }
 
 func (this *WriteBatch) Delete(key []byte) {
-	newkey := append(this.prefix, key...)
-	this.batch.Delete(newkey)
-	if len(this.db.hooks) != 0 {
-		tmp := &tmpBatchHook{db: this.db, batch: this.batch}
-		for _, h := range this.db.hooks {
-			h(key, nil, tmp)
-		}
+	if this.hook != nil {
+		this.db.deleteInHook(key, this.hook)
+	} else {
+		newkey := append(this.db.prefix, key...)
+		this.batch.Delete(newkey)
 	}
 }
 
 func (this *WriteBatch) Put(key, value []byte) {
-	if len(this.db.hooks) != 0 {
-		tmp := &tmpBatchHook{db: this.db, batch: this.batch}
-		for _, h := range this.db.hooks {
-			h(key, value, tmp)
-		}
+	if this.hook != nil {
+		this.db.putInHook(key, value, this.hook)
+	} else {
+		newkey := append(this.db.prefix, key...)
+		this.batch.Put(newkey, value)
 	}
-	newkey := append(this.prefix, key...)
-	this.batch.Put(newkey, value)	
 }
 
 /**************************************************************
  *
- * tmpHook
+ * Hook
  *
  **************************************************************/
 
-func (this *tmpHook) Delete(key []byte, sublevel *DB) {
+func (this *Hook) Delete(key []byte, sublevel *DB) {
 	this.ensureBatch()
 	if sublevel != nil {
-		sublevel.DeleteInBatch(key, this.batch)
+		sublevel.deleteInHook(key, this)
 	} else {
 		newkey := append(this.db.prefix, key...)
 		this.batch.Delete(newkey)
 	}
 }
 
-func (this *tmpHook) Put(key, value []byte, sublevel *DB) {
+func (this *Hook) Put(key, value []byte, sublevel *DB) {
 	this.ensureBatch()
 	if sublevel != nil {
-		sublevel.PutInBatch(key, value, this.batch)
+		sublevel.putInHook(key, value, this)
 	} else {
 		newkey := append(this.db.prefix, key...)
 		this.batch.Put(newkey, value)	
 	}
 }
 
-func (this *tmpHook) ensureBatch() {
+func (this *Hook) ensureBatch() {
 	if this.batch != nil {
 		return
 	}
 	this.batch = levigo.NewWriteBatch()
-	newkey := append(this.db.prefix, this.key...)
-	if this.value == nil {
-		this.batch.Delete(newkey)
-	} else {
-		this.batch.Put(newkey, this.value)
+	if this.key != nil {
+		newkey := append(this.db.prefix, this.key...)
+		if this.value == nil {
+			this.batch.Delete(newkey)
+		} else {
+			this.batch.Put(newkey, this.value)
+		}
+		this.kv = []KeyValue{KeyValue{newkey, this.value}}
+		this.key = nil
+		this.value = nil
 	}
 }
 
-/**************************************************************
- *
- * tmpBatchHook
- *
- **************************************************************/
-
-func (this *tmpBatchHook) Delete(key []byte, sublevel *DB) {
-	if sublevel != nil {
-		sublevel.DeleteInBatch(key, this.batch)
-	} else {
-		newkey := append(this.db.prefix, key...)
-		this.batch.Delete(newkey)
+func (this *Hook) addSublevel(sublevel *DB) {
+	if this.db == sublevel {
+		return
 	}
-}
-
-func (this *tmpBatchHook) Put(key, value []byte, sublevel *DB) {
-	if sublevel != nil {
-		sublevel.PutInBatch(key, value, this.batch)
-	} else {
-		newkey := append(this.db.prefix, key...)
-		this.batch.Put(newkey, value)	
+	if this.sublevels == nil {
+		this.sublevels = make(map[string]*DB)
+		this.sublevels[sublevel.prefixStr] = sublevel
+	} else if _, ok := this.sublevels[sublevel.prefixStr]; !ok {
+		this.sublevels[sublevel.prefixStr] = sublevel		
 	}
 }
