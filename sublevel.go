@@ -25,7 +25,9 @@ type Hook interface {
 }
 */
 
-type HookFunc func(key, value []byte, hook *Hook)
+type PreFunc func(key, value []byte, hook *Hook)
+type PostFunc func(key, value []byte)
+
 
 type WriteBatch struct {
 	db *DB
@@ -37,8 +39,8 @@ type DB struct {
 	db *levigo.DB
 	prefixStr string
 	prefix []byte
-	pre []HookFunc
-	post []HookFunc
+	pre []PreFunc
+	post []PostFunc
 }
 
 type sublevelIterator struct {
@@ -75,11 +77,11 @@ func (this *DB) LevelDB() *levigo.DB {
 	return this.db
 }
 
-func (this *DB) Pre(hook HookFunc) {
+func (this *DB) Pre(hook PreFunc) {
 	this.pre = append(this.pre, hook)
 }
 
-func (this *DB) Post(hook HookFunc) {
+func (this *DB) Post(hook PostFunc) {
 	this.post = append(this.post, hook)
 }
 
@@ -211,24 +213,19 @@ func (this *DB) Write(wo *levigo.WriteOptions, w *WriteBatch) (err error) {
 	return
 }
 
-func (this *DB) Simulate(wo *levigo.WriteOptions, key, value []byte) (err error) {
-	var hook *Hook
-	if len(this.pre) != 0 || len(this.post) != 0 {
-		hook = &Hook{db: this, key: key, value: value}
-		for _, h := range this.pre {
-			h(key, value, hook)
-		}
+func (this *DB) RunHook(wo *levigo.WriteOptions, pre PreFunc, post PostFunc, key, value []byte) (err error) {
+	hook := &Hook{db: this, key: key, value: value}
+	if pre != nil {
+		pre(key, value, hook)
 	}
-	if hook != nil && hook.batch != nil {
+	if hook.batch != nil {
 		err = this.db.Write(wo, hook.batch)
 		hook.batch.Close()
 	}
-	if hook != nil {
-		this.runPost(hook)
-		if hook.sublevels != nil {
-			for _, s := range hook.sublevels {
-				s.runPost(hook)
-			}
+	this.runPostHook(hook, post)
+	if hook.sublevels != nil {
+		for _, s := range hook.sublevels {
+			s.runPostHook(hook, nil)
 		}
 	}
 	return
@@ -240,15 +237,33 @@ func (this *DB) runPost(hook *Hook) {
 			for _, kv := range hook.kv {
 				if bytes.HasPrefix(kv.key, this.prefix) {
 					for _, h := range this.post {
-						h(kv.key[len(this.prefix):], kv.value, hook)
+						h(kv.key[len(this.prefix):], kv.value)
 					}
 				}
 			}
-		} else if (hook.db == this && hook.key != nil) {
+		} else if hook.db == this && hook.key != nil {
 			for _, h := range this.post {
-				h(hook.key, hook.value, hook)
+				h(hook.key, hook.value)
 			}
 		}
+	}
+}
+
+func (this *DB) runPostHook(hook *Hook, post PostFunc) {
+	if hook.batch != nil {
+		for i, kv := range hook.kv {
+			if bytes.HasPrefix(kv.key, this.prefix) {
+				if i == 0 && post != nil {
+					post(kv.key[len(this.prefix):], kv.value)
+				} else if i > 0 {
+					for _, h := range this.post {
+						h(hook.key, hook.value)
+					}						
+				}
+			}
+		}
+	} else if post != nil && hook.db == this && hook.key != nil {
+		post(hook.key, hook.value)
 	}
 }
 

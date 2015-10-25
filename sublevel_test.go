@@ -145,7 +145,7 @@ func TestHook(t *testing.T) {
 	post1Called := 0
 	post3Called := 0
 
-	sub1.Post(func(key, value []byte, hook *Hook) {
+	sub1.Post(func(key, value []byte) {
 		post1Called++
 		val, err := sub1.Get(ro, key)
 		if err != nil || bytes.Compare(val, value) != 0 {
@@ -153,7 +153,7 @@ func TestHook(t *testing.T) {
 		}		
 	})
 
-	sub3.Post(func(key, value []byte, hook *Hook) {
+	sub3.Post(func(key, value []byte) {
 		post3Called++
 		val, err := sub3.Get(ro, key)
 		if err != nil || bytes.Compare(val, value) != 0 {
