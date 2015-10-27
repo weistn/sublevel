@@ -77,6 +77,10 @@ func (this *DB) LevelDB() *levigo.DB {
 	return this.db
 }
 
+func (this *DB) Prefix() string {
+	return this.prefixStr
+}
+
 func (this *DB) Pre(hook PreFunc) {
 	this.pre = append(this.pre, hook)
 }
